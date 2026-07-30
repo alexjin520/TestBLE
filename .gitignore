@@ -1,0 +1,47 @@
+# Credentials and signing material
+*.key
+*.keystore
+*.p12
+*.pfx
+*.pk8
+*.pem
+.env
+.env.*
+security/
+
+# Local configuration and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*:Zone.Identifier
+
+# Generated and temporary content
+*.log
+*.rar
+*.zip
+*.7z
+*.tar
+*.tar.gz
+__pycache__/
+*.py[cod]
+tempfile/
+tmp/
+build/
+out/
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+pubspec.lock
+**/android/.gradle/
+**/android/local.properties
+**/ios/Flutter/ephemeral/
+
+# Ingenic SDK output if the overlay is tested in place
+sdk-overlay/buildroot/
+sdk-overlay/external/
+sdk-overlay/out/
+sdk-overlay/prebuilts/

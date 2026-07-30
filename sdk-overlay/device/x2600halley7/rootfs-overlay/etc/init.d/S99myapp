@@ -1,0 +1,439 @@
+#!/bin/sh
+# MyApp: fNIRS selectable event backend (log -> /tmp/fnirs.log)
+#
+# BLE 射频由 S91/aic-radio-sm 负责；my-fnirs 内勿再调 aic-radio-sm（会 lock timeout，
+# 导致 fusb 打不开 /dev/ttyS1）。FNIRS_BLE_DISABLE=1 仅关闭 my-fnirs 内的 BLE 自启。
+
+FNIRS=/opt/golgi/my-fnirs
+APP_GOLGI=/app_data/golgi
+FNIRS_LOG=/tmp/fnirs.log
+FNIRS_PID=/var/run/my-fnirs.pid
+FNIRS_BACKEND="${FNIRS_BACKEND:-event}"
+FNIRS_UV_AUTOBOOT="${FNIRS_UV_AUTOBOOT:-0}"
+FNIRS_UV_PROFILE="${FNIRS_UV_PROFILE:-full}"
+UV_RUNTIME_MARKER=/var/run/my-fnirs.allow-uv
+UV_PROBE_MARKER=/var/run/my-fnirs.uv-probe-ok
+UV_PROFILE_MARKER=/var/run/my-fnirs.uv-profile
+UV_PROBE_LOG="$APP_GOLGI/fnirs-uv-probe.log"
+UV_STAGE_LOG="$APP_GOLGI/uv-stage.log"
+
+[ -r /etc/default/fnirs ] && . /etc/default/fnirs
+
+# A broken experimental backend must not make the board unbootable.  A manual
+# "switch uv" creates this volatile marker; /var/run is cleared on reboot.
+if [ "$FNIRS_BACKEND" = uv ] &&
+   [ "$FNIRS_UV_AUTOBOOT" != 1 ] &&
+   [ ! -e "$UV_RUNTIME_MARKER" ]; then
+	echo "S99myapp: UV autoboot disabled; falling back to event"
+	FNIRS_BACKEND=event
+fi
+
+setup_ld_path() {
+	if [ -f "$APP_GOLGI/lib/libevent-2.1.so.7.0.1" ] ||
+	   [ -f "$APP_GOLGI/lib/libuv.so.1.0.0" ]; then
+		export LD_LIBRARY_PATH="$APP_GOLGI/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+	elif [ -f /usr/lib/libevent-2.1.so.7.0.1 ] ||
+	     [ -f /usr/lib/libevent-2.1.so.7 ] ||
+	     [ -f /usr/lib/libuv.so.1 ]; then
+		export LD_LIBRARY_PATH="/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+	fi
+}
+
+resolve_fnirs_bin() {
+	local name=my-fnirs
+
+	case "$FNIRS_BACKEND" in
+		uv) name=my-fnirs-uv ;;
+		event) ;;
+		*)
+			echo "S99myapp: invalid FNIRS_BACKEND=$FNIRS_BACKEND" >&2
+			return 1
+			;;
+	esac
+
+	if [ -x "$APP_GOLGI/$name" ]; then
+		echo "$APP_GOLGI/$name"
+	elif [ -x "/opt/golgi/$name" ]; then
+		echo "/opt/golgi/$name"
+	fi
+}
+
+ensure_app_data_rw() {
+	if mkdir -p "$APP_GOLGI" 2>/dev/null && touch "$APP_GOLGI/.rw_test" 2>/dev/null; then
+		rm -f "$APP_GOLGI/.rw_test"
+		return 0
+	fi
+
+	if [ ! -d /app_data ] || ! mount | grep -q ' on /app_data '; then
+		mkdir -p /app_data 2>/dev/null
+		mount /dev/mmcblk0p4 /app_data 2>/dev/null \
+			|| mount -t ext4 /dev/mmcblk0p4 /app_data 2>/dev/null
+	fi
+	mount -o remount,rw /app_data 2>/dev/null
+
+	mkdir -p "$APP_GOLGI" 2>/dev/null || return 1
+	touch "$APP_GOLGI/.rw_test" 2>/dev/null || return 1
+	rm -f "$APP_GOLGI/.rw_test"
+	return 0
+}
+
+pid_is_fnirs() {
+	local pid="$1"
+	local exe
+
+	case "$pid" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$pid" -gt 1 ] 2>/dev/null || return 1
+	[ -e "/proc/$pid/exe" ] || return 1
+
+	exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
+	case "$exe" in
+		"$APP_GOLGI/my-fnirs"|"$APP_GOLGI/my-fnirs (deleted)"|\
+		"$APP_GOLGI/my-fnirs-uv"|"$APP_GOLGI/my-fnirs-uv (deleted)"|\
+		/opt/golgi/my-fnirs|"/opt/golgi/my-fnirs (deleted)"|\
+		/opt/golgi/my-fnirs-uv|"/opt/golgi/my-fnirs-uv (deleted)")
+			return 0
+			;;
+	esac
+	return 1
+}
+
+running_fnirs_pid() {
+	local pid
+
+	[ -r "$FNIRS_PID" ] || return 1
+	pid=$(cat "$FNIRS_PID" 2>/dev/null)
+	pid_is_fnirs "$pid" || return 1
+	echo "$pid"
+}
+
+uv_fingerprint() {
+	local bin="$1"
+
+	md5sum "$bin" 2>/dev/null | awk '{print $1}'
+}
+
+uv_probe_is_current() {
+	local bin="$1"
+	local expected actual
+
+	[ -r "$UV_PROBE_MARKER" ] || return 1
+	expected=$(cat "$UV_PROBE_MARKER" 2>/dev/null)
+	actual=$(uv_fingerprint "$bin")
+	[ -n "$actual" ] && [ "$expected" = "$actual" ]
+}
+
+start_fnirs() {
+	local bin="$1"
+	local pid other i
+
+	pid=$(running_fnirs_pid) && {
+		echo "S99myapp: already running pid=$pid"
+		return 0
+	}
+	rm -f "$FNIRS_PID"
+
+	# Never start a second backend merely because a pidfile is missing.
+	for other in $(pidof my-fnirs my-fnirs-uv 2>/dev/null); do
+		if pid_is_fnirs "$other"; then
+			echo "S99myapp: ERROR — unmanaged fNIRS process pid=$other; refusing duplicate start" >&2
+			return 1
+		fi
+	done
+
+	echo "S99myapp: exec $bin" >> "$FNIRS_LOG"
+	ldd "$bin" >> "$FNIRS_LOG" 2>&1 || true
+	# adb shell sends SIGHUP to its remaining background jobs when the shell
+	# closes.  Ignore HUP in a short-lived subshell, then exec so $! remains
+	# the exact application PID (no supervisor and no restart loop).
+	(
+		trap '' HUP
+		exec "$bin"
+	) >> "$FNIRS_LOG" 2>&1 </dev/null &
+	pid=$!
+
+	# Require three consecutive seconds of the expected executable before
+	# reporting success.  This catches immediate loader/startup failures.
+	for i in 1 2 3; do
+		sleep 1
+		pid_is_fnirs "$pid" || break
+	done
+	if ! pid_is_fnirs "$pid"; then
+		echo "S99myapp: ERROR — $bin failed to stay running" >&2
+		# This is the exact child created above, not a PID read from a file.
+		kill "$pid" 2>/dev/null
+		wait "$pid" 2>/dev/null
+		return 1
+	fi
+
+	echo "$pid" > "$FNIRS_PID"
+	echo "S99myapp: started pid=$pid"
+}
+
+stop_fnirs() {
+	local pid i
+
+	if ! pid=$(running_fnirs_pid); then
+		[ -e "$FNIRS_PID" ] &&
+			echo "S99myapp: ignoring stale or unsafe pidfile"
+		rm -f "$FNIRS_PID"
+		echo "S99myapp: not running"
+		return 0
+	fi
+
+	echo "S99myapp: stopping pid=$pid"
+	kill "$pid" 2>/dev/null
+	for i in 1 2 3 4 5; do
+		pid_is_fnirs "$pid" || break
+		sleep 1
+	done
+
+	if pid_is_fnirs "$pid"; then
+		echo "S99myapp: pid=$pid did not exit; sending KILL"
+		kill -9 "$pid" 2>/dev/null
+	fi
+	rm -f "$FNIRS_PID"
+}
+
+start() {
+	export FNIRS_BLE_DISABLE=1
+
+	ensure_app_data_rw || echo "S99myapp: warning — $APP_GOLGI not writable"
+	setup_ld_path
+
+	mkdir -p /opt/golgi "$APP_GOLGI"
+	sleep 1
+
+	# Keep experimental-backend diagnostics across a watchdog reset/reboot.
+	if [ "$FNIRS_BACKEND" = uv ]; then
+		FNIRS_LOG="$APP_GOLGI/fnirs-uv.log"
+		case "$FNIRS_UV_PROFILE" in
+		safe)
+			export FNIRS_UV_SAFE_MODE=1
+			;;
+		business|core|full)
+			export FNIRS_UV_SAFE_MODE=0
+			;;
+		*)
+			echo "S99myapp: ERROR — invalid UV profile=$FNIRS_UV_PROFILE" >&2
+			return 1
+			;;
+		esac
+		export FNIRS_UV_PROFILE
+		# The MIPS runtime can stall before main() while lazily resolving this
+		# large executable's libuv/BlueZ symbol set.  Eager binding is stable.
+		export LD_BIND_NOW=1
+	else
+		unset FNIRS_UV_SAFE_MODE
+		unset FNIRS_UV_PROFILE
+		unset LD_BIND_NOW
+	fi
+
+	FNIRS_BIN=$(resolve_fnirs_bin)
+
+	if [ -n "$FNIRS_BIN" ] && [ -x "$FNIRS_BIN" ]; then
+		echo "S99myapp: starting backend=$FNIRS_BACKEND profile=${FNIRS_UV_PROFILE:-n/a} from $FNIRS_BIN (embedded GATT)"
+		echo "S99myapp: log -> $FNIRS_LOG"
+		start_fnirs "$FNIRS_BIN" || return 1
+	else
+		echo "S99myapp: ERROR — no binary for backend=$FNIRS_BACKEND"
+		ls -la "$APP_GOLGI" /opt/golgi 2>&1 || true
+		df -h / /app_data 2>/dev/null || true
+		return 1
+	fi
+
+	# BLE radio ownership belongs exclusively to S91/aic-radio-sm.  Do not
+	# probe or reconfigure it here: btmgmt may block during early boot.
+}
+
+stop() {
+	stop_fnirs
+}
+
+status() {
+	local pid exe backend profile
+
+	if pid=$(running_fnirs_pid); then
+		exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+		case "$exe" in
+			*my-fnirs-uv*)
+				backend=uv
+				profile=$(cat "$UV_PROFILE_MARKER" 2>/dev/null)
+				[ -n "$profile" ] || profile=unknown
+				;;
+			*)
+				backend=event
+				profile=n/a
+				;;
+		esac
+		echo "S99myapp: running pid=$pid exe=$exe backend=$backend profile=$profile"
+		return 0
+	fi
+	echo "S99myapp: not running"
+	return 1
+}
+
+probe_uv() {
+	local current current_exe bin probe_pid fingerprint i
+
+	if ! current=$(running_fnirs_pid); then
+		echo "S99myapp: ERROR — start the event backend before probing UV" >&2
+		return 1
+	fi
+	current_exe=$(readlink "/proc/$current/exe" 2>/dev/null)
+	case "$current_exe" in
+		*my-fnirs-uv*)
+			echo "S99myapp: ERROR — UV is already active" >&2
+			return 1
+			;;
+	esac
+
+	ensure_app_data_rw || {
+		echo "S99myapp: ERROR — $APP_GOLGI is not writable" >&2
+		return 1
+	}
+	setup_ld_path
+	bin="$APP_GOLGI/my-fnirs-uv"
+	[ -x "$bin" ] || bin=/opt/golgi/my-fnirs-uv
+	[ -x "$bin" ] || {
+		echo "S99myapp: ERROR — my-fnirs-uv not installed" >&2
+		return 1
+	}
+
+	rm -f "$UV_PROBE_MARKER"
+	: > "$UV_PROBE_LOG" || return 1
+	: > "$UV_STAGE_LOG" || return 1
+	echo "S99myapp: UV probe prepared" >> "$UV_STAGE_LOG"
+	# Make the inode and initial record durable before starting experimental
+	# code, so a hard lockup cannot erase the diagnostic file.
+	sync
+	echo "S99myapp: probing $bin for 3 seconds; event pid=$current stays running"
+	echo "S99myapp: probe exec $bin" >> "$UV_PROBE_LOG"
+	FNIRS_BLE_DISABLE=1 FNIRS_UV_SAFE_MODE=1 FNIRS_UV_PROFILE=safe LD_BIND_NOW=1 \
+		"$bin" >> "$UV_PROBE_LOG" 2>&1 </dev/null &
+	probe_pid=$!
+
+	for i in 1 2 3; do
+		sleep 1
+		if ! pid_is_fnirs "$probe_pid"; then
+			echo "S99myapp: ERROR — UV probe exited during initialization" >&2
+			wait "$probe_pid" 2>/dev/null
+			tail -40 "$UV_PROBE_LOG" 2>/dev/null
+			return 1
+		fi
+	done
+
+	kill "$probe_pid" 2>/dev/null
+	for i in 1 2 3; do
+		pid_is_fnirs "$probe_pid" || break
+		sleep 1
+	done
+	if pid_is_fnirs "$probe_pid"; then
+		kill -9 "$probe_pid" 2>/dev/null
+	fi
+	wait "$probe_pid" 2>/dev/null
+
+	if ! pid_is_fnirs "$current"; then
+		echo "S99myapp: ERROR — event backend disappeared during UV probe" >&2
+		return 1
+	fi
+	fingerprint=$(uv_fingerprint "$bin")
+	[ -n "$fingerprint" ] || {
+		echo "S99myapp: ERROR — cannot fingerprint $bin" >&2
+		return 1
+	}
+	echo "$fingerprint" > "$UV_PROBE_MARKER" || return 1
+	echo "S99myapp: UV probe passed md5=$fingerprint; event pid=$current still running"
+}
+
+switch_backend() {
+	local backend="$1"
+	local requested_profile="${2:-full}"
+	local uv_bin
+
+	case "$backend" in
+	event)
+		rm -f "$UV_RUNTIME_MARKER" "$UV_PROFILE_MARKER"
+		;;
+	uv)
+		case "$requested_profile" in
+			safe|business|core|full) ;;
+			*)
+				echo "Usage: $0 switch uv [safe|business|core|full]" >&2
+				return 1
+				;;
+		esac
+		uv_bin="$APP_GOLGI/my-fnirs-uv"
+		[ -x "$uv_bin" ] || uv_bin=/opt/golgi/my-fnirs-uv
+		[ -x "$uv_bin" ] || {
+				echo "S99myapp: ERROR — my-fnirs-uv not installed" >&2
+				return 1
+			}
+		if ! uv_probe_is_current "$uv_bin"; then
+			echo "S99myapp: ERROR — this UV binary has not passed the safe probe" >&2
+			echo "S99myapp: run: $0 probe uv" >&2
+			return 1
+		fi
+		: > "$UV_RUNTIME_MARKER" || return 1
+		echo "$requested_profile" > "$UV_PROFILE_MARKER" || return 1
+		FNIRS_UV_PROFILE="$requested_profile"
+		;;
+	*)
+		echo "Usage: $0 switch event | switch uv [safe|business|core|full]" >&2
+		return 1
+		;;
+	esac
+
+	if ! stop; then
+		echo "S99myapp: stop failed; switch aborted" >&2
+		return 1
+	fi
+	FNIRS_BACKEND="$backend"
+	if start; then
+		return 0
+	fi
+
+	if [ "$backend" = uv ]; then
+		echo "S99myapp: UV start failed; rolling back to event" >&2
+		rm -f "$UV_RUNTIME_MARKER" "$UV_PROFILE_MARKER" "$FNIRS_PID"
+		FNIRS_BACKEND=event
+		start || echo "S99myapp: ERROR — event rollback also failed" >&2
+	fi
+	return 1
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	restart)
+		if stop; then
+			start
+		else
+			echo "S99myapp: stop failed; restart aborted" >&2
+			exit 1
+		fi
+		;;
+	status)
+		status
+		;;
+	switch)
+		switch_backend "$2" "$3"
+		;;
+	probe)
+		if [ "$2" = uv ]; then
+			probe_uv
+		else
+			echo "Usage: $0 probe uv" >&2
+			exit 1
+		fi
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|status|probe uv|switch event|switch uv [safe|business|core|full]}"
+		exit 1
+		;;
+esac

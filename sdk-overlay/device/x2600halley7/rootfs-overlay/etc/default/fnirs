@@ -1,0 +1,14 @@
+# Select exactly one implementation.  Both use the same fNIRS business code.
+# event: /opt/golgi/my-fnirs (production baseline)
+# uv:    /opt/golgi/my-fnirs-uv (comparison build)
+FNIRS_BACKEND=event
+
+# Safety default: even if FNIRS_BACKEND=uv is left behind, reboot with event.
+# Test UV for the current boot with: /etc/init.d/S99myapp switch uv
+# Set to 1 only after UV has been proven stable on the target.
+FNIRS_UV_AUTOBOOT=0
+
+# Normal "switch uv" runs the complete hardware/GATT stack.  Diagnostic
+# profiles remain available as: safe, business, core, full.
+FNIRS_UV_PROFILE=full
+FNIRS_UV_SAFE_MODE=0
