@@ -130,7 +130,7 @@ diagnostics are written under `/app_data/golgi/` on the board.
 
 - [BLE framing and tuning](sdk-overlay/packages/example/ble_hci_test/BLE文件传输参数说明.md)
 - [GATT and mobile workflow](sdk-overlay/packages/example/ble_hci_test/README.md)
-- [libevent refactor report](docs/fNIRS项目Libevent重构分析报告.md)
+- [event-loop refactor report (libevent and libuv)](docs/fnirs-event-loop-refactor.md)
 - [libuv comparison backend](sdk-overlay/packages/example/x2600-fNIRS/uv/README.md)
 
 ## Security and licensing
